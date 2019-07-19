@@ -223,12 +223,12 @@ def run_customized_training_loop(
           if eval_metric else None)
 
       # Create summary writers
-      eval_summary_writer = tf.summary.create_file_writer(
+      eval_summary_writer = tf.compat.v2.summary.create_file_writer(
           os.path.join(model_dir, 'summaries/eval'))
       if steps_per_loop >= _MIN_SUMMARY_STEPS:
         # Only writes summary when the stats are collected sufficiently over
         # enough steps.
-        train_summary_writer = tf.summary.create_file_writer(
+        train_summary_writer = tf.compat.v2.summary.create_file_writer(
             os.path.join(model_dir, 'summaries/train'))
       else:
         train_summary_writer = None
