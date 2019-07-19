@@ -46,6 +46,13 @@ MODEL_CONFIG_FILE_PATH = 'gs://cloud-tpu-checkpoints/bert/tf_20/uncased_L-24_H-1
 
 FLAGS = flags.FLAGS
 
+from tensorflow.python.keras.engine import base_layer_utils
+def is_subclassed(layer):
+  """Prevent Keras from using AutoGraph."""
+  return False
+
+base_layer_utils.is_subclassed = is_subclassed
+
 
 class BertSquadBenchmarkBase(benchmark_utils.BertBenchmarkBase):
   """Base class to hold methods common to test classes in the module."""
@@ -130,6 +137,7 @@ class BertSquadBenchmarkReal(BertSquadBenchmarkBase):
   def _run_and_report_benchmark(self):
     """Runs the benchmark and reports various metrics."""
     tf.config.optimizer.set_experimental_options({"disable_meta_optimizer": True})
+
     start_time_sec = time.time()
     profiler = cProfile.Profile()
     profiler.enable()
