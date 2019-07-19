@@ -129,6 +129,7 @@ class BertSquadBenchmarkReal(BertSquadBenchmarkBase):
 
   def _run_and_report_benchmark(self):
     """Runs the benchmark and reports various metrics."""
+    tf.config.optimizer.set_experimental_options({"disable_meta_optimizer": True})
     start_time_sec = time.time()
     profiler = cProfile.Profile()
     profiler.enable()
