@@ -276,7 +276,7 @@ def run_customized_training_loop(
         Raises:
           ValueError: Any of the arguments or tensor shapes are invalid.
         """
-        strategy.experimental_run_v2(_replicated_step, args=(next(iterator),))
+        return strategy.experimental_run_v2(_replicated_step, args=(next(iterator),))
 
       def test_step(iterator):
         """Calculates evaluation metrics on distributed devices."""
