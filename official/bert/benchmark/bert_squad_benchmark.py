@@ -18,6 +18,7 @@ from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
 
+import cProfile
 import json
 import os
 import time
@@ -129,7 +130,11 @@ class BertSquadBenchmarkReal(BertSquadBenchmarkBase):
   def _run_and_report_benchmark(self):
     """Runs the benchmark and reports various metrics."""
     start_time_sec = time.time()
+    profiler = cProfile.Profile()
+    profiler.enable()
     self._train_squad()
+    profiler.disable()
+    profiler.dump_stats(os.path.join(self.output_dir, "end_to_end.prof"))
     wall_time_sec = time.time() - start_time_sec
 
     summary = self._read_training_summary_from_file()
