@@ -267,6 +267,7 @@ def run_customized_training_loop(
         for _ in tf.range(steps):
           strategy.experimental_run_v2(_replicated_step, args=(next(iterator),))
 
+      @tf.function(autograph=False)
       def train_single_step(iterator):
         """Performs a distributed training step.
 
@@ -332,6 +333,8 @@ def run_customized_training_loop(
       current_step = optimizer.iterations.numpy()
       checkpoint_name = 'ctl_step_{step}.ckpt'
 
+      concrete_train_fn = train_single_step.get_concrete_function(train_iterator)
+
       while current_step < total_training_steps:
         # Training loss/metric are taking average over steps inside micro
         # training loop. We reset the their values before each round.
@@ -343,14 +346,17 @@ def run_customized_training_loop(
         # Runs several steps in the host while loop.
         steps = _steps_to_run(current_step, steps_per_epoch, steps_per_loop)
 
-        if steps == 1:
-          # TODO(zongweiz): merge with train_steps once tf.while_loop
-          # GPU performance bugs are fixed.
-          train_single_step(train_iterator)
-        else:
-          # Converts steps to a Tensor to avoid tf.function retracing.
-          train_steps(train_iterator,
-                      tf.convert_to_tensor(steps, dtype=tf.int32))
+        for _ in range(steps):
+          concrete_train_fn()
+
+        # if steps == 1:
+        #   # TODO(zongweiz): merge with train_steps once tf.while_loop
+        #   # GPU performance bugs are fixed.
+        #   train_single_step(train_iterator)
+        # else:
+        #   # Converts steps to a Tensor to avoid tf.function retracing.
+        #   train_steps(train_iterator,
+        #               tf.convert_to_tensor(steps, dtype=tf.int32))
         _run_callbacks_on_batch_end(current_step)
         current_step += steps
 
