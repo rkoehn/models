@@ -35,7 +35,8 @@ from official.bert import model_saving_utils
 from official.bert import model_training_utils
 from official.bert import modeling
 from official.bert import optimization
-from official.bert import tpu_lib
+from official.utils.misc import keras_utils
+from official.utils.misc import tpu_lib
 
 flags.DEFINE_enum(
     'mode', 'train_and_eval', ['train_and_eval', 'export_only'],
@@ -47,10 +48,6 @@ flags.DEFINE_string('train_data_path', None,
                     'Path to training data for BERT classifier.')
 flags.DEFINE_string('eval_data_path', None,
                     'Path to evaluation data for BERT classifier.')
-flags.DEFINE_string(
-    'model_export_path', None,
-    'Path to the directory, where trainined model will be '
-    'exported.')
 # Model training specific flags.
 flags.DEFINE_string(
     'input_meta_data_path', None,
@@ -64,7 +61,7 @@ common_flags.define_common_bert_flags()
 FLAGS = flags.FLAGS
 
 
-def get_loss_fn(num_classes, loss_scale=1.0):
+def get_loss_fn(num_classes, loss_factor=1.0):
   """Gets the classification loss function."""
 
   def classification_loss_fn(labels, logits):
@@ -76,7 +73,7 @@ def get_loss_fn(num_classes, loss_scale=1.0):
     per_example_loss = -tf.reduce_sum(
         tf.cast(one_hot_labels, dtype=tf.float32) * log_probs, axis=-1)
     loss = tf.reduce_mean(per_example_loss)
-    loss *= loss_scale
+    loss *= loss_factor
     return loss
 
   return classification_loss_fn
@@ -94,7 +91,8 @@ def run_customized_training(strategy,
                             initial_lr,
                             init_checkpoint,
                             use_remote_tpu=False,
-                            custom_callbacks=None):
+                            custom_callbacks=None,
+                            run_eagerly=False):
   """Run BERT classifier training using low-level API."""
   max_seq_length = input_meta_data['max_seq_length']
   num_classes = input_meta_data['num_labels']
@@ -113,14 +111,26 @@ def run_customized_training(strategy,
       drop_remainder=False)
 
   def _get_classifier_model():
+    """Gets a classifier model."""
     classifier_model, core_model = (
         bert_models.classifier_model(bert_config, tf.float32, num_classes,
                                      max_seq_length))
     classifier_model.optimizer = optimization.create_optimizer(
         initial_lr, steps_per_epoch * epochs, warmup_steps)
+    if FLAGS.fp16_implementation == 'graph_rewrite':
+      # Note: when flags_obj.fp16_implementation == "graph_rewrite", dtype as
+      # determined by flags_core.get_tf_dtype(flags_obj) would be 'float32'
+      # which will ensure tf.compat.v2.keras.mixed_precision and
+      # tf.train.experimental.enable_mixed_precision_graph_rewrite do not double
+      # up.
+      classifier_model.optimizer = tf.train.experimental.enable_mixed_precision_graph_rewrite(
+          classifier_model.optimizer)
     return classifier_model, core_model
 
-  loss_fn = get_loss_fn(num_classes, loss_scale=1.0)
+  loss_fn = get_loss_fn(
+      num_classes,
+      loss_factor=1.0 /
+      strategy.num_replicas_in_sync if FLAGS.scale_loss else 1.0)
 
   # Defines evaluation metrics function, which will create metrics in the
   # correct device and strategy scope.
@@ -142,7 +152,8 @@ def run_customized_training(strategy,
       init_checkpoint=init_checkpoint,
       metric_fn=metric_fn,
       use_remote_tpu=use_remote_tpu,
-      custom_callbacks=custom_callbacks)
+      custom_callbacks=custom_callbacks,
+      run_eagerly=run_eagerly)
 
 
 def export_classifier(model_export_path, input_meta_data):
@@ -174,6 +185,8 @@ def run_bert(strategy, input_meta_data):
 
   if FLAGS.mode != 'train_and_eval':
     raise ValueError('Unsupported mode is specified: %s' % FLAGS.mode)
+  # Enables XLA in Session Config. Should not be set for TPU.
+  keras_utils.set_config_v2(FLAGS.enable_xla)
 
   bert_config = modeling.BertConfig.from_json_file(FLAGS.bert_config_file)
   epochs = FLAGS.num_train_epochs
@@ -201,10 +214,11 @@ def run_bert(strategy, input_meta_data):
       warmup_steps,
       FLAGS.learning_rate,
       FLAGS.init_checkpoint,
-      use_remote_tpu=use_remote_tpu)
+      use_remote_tpu=use_remote_tpu,
+      run_eagerly=FLAGS.run_eagerly)
 
   if FLAGS.model_export_path:
-    with tf.device(model_training_utils.get_primary_cpu_task(use_remote_tpu)):
+    with tf.device(tpu_lib.get_primary_cpu_task(use_remote_tpu)):
       model_saving_utils.export_bert_model(
           FLAGS.model_export_path, model=trained_model)
   return trained_model

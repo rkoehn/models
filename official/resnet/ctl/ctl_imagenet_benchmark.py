@@ -22,7 +22,7 @@ import time
 from absl import flags
 import tensorflow as tf
 
-from official.resnet import imagenet_main
+from official.vision.image_classification import common
 from official.resnet.ctl import ctl_imagenet_main
 from official.resnet.ctl import ctl_common
 from official.utils.testing.perfzero_benchmark import PerfZeroBenchmark
@@ -118,7 +118,7 @@ class Resnet50CtlAccuracy(CtlBenchmark):
 
     flag_methods = [
         ctl_common.define_ctl_flags,
-        lambda: imagenet_main.define_imagenet_flags()
+        common.define_keras_flags
     ]
 
     self.data_dir = os.path.join(root_data_dir, 'imagenet')
@@ -135,6 +135,21 @@ class Resnet50CtlAccuracy(CtlBenchmark):
     FLAGS.epochs_between_evals = 10
     FLAGS.model_dir = self._get_model_dir('benchmark_8_gpu')
     FLAGS.dtype = 'fp32'
+    # Add some thread tunings to improve performance.
+    FLAGS.datasets_num_private_threads = 14
+    self._run_and_report_benchmark()
+
+  def benchmark_8_gpu_amp(self):
+    """Test Keras model with eager, 8 GPUs with automatic mixed precision."""
+    self._setup()
+    FLAGS.num_gpus = 8
+    FLAGS.data_dir = self.data_dir
+    FLAGS.batch_size = 128 * 8
+    FLAGS.train_epochs = 90
+    FLAGS.epochs_between_evals = 10
+    FLAGS.model_dir = self._get_model_dir('benchmark_8_gpu_amp')
+    FLAGS.dtype = 'fp16'
+    FLAGS.fp16_implementation = 'graph_rewrite'
     # Add some thread tunings to improve performance.
     FLAGS.datasets_num_private_threads = 14
     self._run_and_report_benchmark()
@@ -162,7 +177,7 @@ class Resnet50CtlBenchmarkBase(CtlBenchmark):
   def __init__(self, output_dir=None, default_flags=None):
     flag_methods = [
         ctl_common.define_ctl_flags,
-        lambda: imagenet_main.define_imagenet_flags()
+        common.define_keras_flags
     ]
 
     super(Resnet50CtlBenchmarkBase, self).__init__(
@@ -206,6 +221,43 @@ class Resnet50CtlBenchmarkBase(CtlBenchmark):
     FLAGS.batch_size = 128
     self._run_and_report_benchmark()
 
+  def benchmark_1_gpu_amp(self):
+    """Test Keras model with 1 GPU with automatic mixed precision."""
+    self._setup()
+
+    FLAGS.num_gpus = 1
+    FLAGS.distribution_strategy = 'default'
+    FLAGS.model_dir = self._get_model_dir('benchmark_1_gpu_amp')
+    FLAGS.batch_size = 128
+    FLAGS.dtype = 'fp16'
+    FLAGS.fp16_implementation = 'graph_rewrite'
+    self._run_and_report_benchmark()
+
+  def benchmark_xla_1_gpu_amp(self):
+    """Test Keras model with XLA and 1 GPU with automatic mixed precision."""
+    self._setup()
+
+    FLAGS.num_gpus = 1
+    FLAGS.distribution_strategy = 'default'
+    FLAGS.model_dir = self._get_model_dir('benchmark_xla_1_gpu_amp')
+    FLAGS.batch_size = 128
+    FLAGS.dtype = 'fp16'
+    FLAGS.fp16_implementation = 'graph_rewrite'
+    FLAGS.enable_xla = True
+    self._run_and_report_benchmark()
+
+  def benchmark_1_gpu_eager(self):
+    """Test Keras model with 1 GPU in pure eager mode."""
+    self._setup()
+
+    FLAGS.num_gpus = 1
+    FLAGS.distribution_strategy = 'default'
+    FLAGS.model_dir = self._get_model_dir('benchmark_1_gpu_eager')
+    FLAGS.batch_size = 64
+    FLAGS.use_tf_function = False
+    FLAGS.single_l2_loss_op = True
+    self._run_and_report_benchmark()
+
   def benchmark_8_gpu(self):
     """Test Keras model with 8 GPUs."""
     self._setup()
@@ -214,6 +266,31 @@ class Resnet50CtlBenchmarkBase(CtlBenchmark):
     FLAGS.distribution_strategy = 'default'
     FLAGS.model_dir = self._get_model_dir('benchmark_8_gpu')
     FLAGS.batch_size = 128 * 8  # 8 GPUs
+    self._run_and_report_benchmark()
+
+  def benchmark_8_gpu_amp(self):
+    """Test Keras model with 8 GPUs with automatic mixed precision."""
+    self._setup()
+
+    FLAGS.num_gpus = 8
+    FLAGS.distribution_strategy = 'default'
+    FLAGS.model_dir = self._get_model_dir('benchmark_8_gpu_amp')
+    FLAGS.batch_size = 128 * 8  # 8 GPUs
+    FLAGS.dtype = 'fp16'
+    FLAGS.fp16_implementation = 'graph_rewrite'
+    self._run_and_report_benchmark()
+
+  def benchmark_xla_8_gpu_amp(self):
+    """Test Keras model with XLA and 8 GPUs with automatic mixed precision."""
+    self._setup()
+
+    FLAGS.num_gpus = 8
+    FLAGS.distribution_strategy = 'default'
+    FLAGS.model_dir = self._get_model_dir('benchmark_xla_8_gpu_amp')
+    FLAGS.batch_size = 128 * 8  # 8 GPUs
+    FLAGS.dtype = 'fp16'
+    FLAGS.fp16_implementation = 'graph_rewrite'
+    FLAGS.enable_xla = True
     self._run_and_report_benchmark()
 
   def fill_report_object(self, stats):

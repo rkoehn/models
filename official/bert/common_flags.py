@@ -15,6 +15,9 @@
 """Defining common flags used across all BERT models/applications."""
 
 from absl import flags
+import tensorflow as tf
+
+from official.utils.flags import core as flags_core
 
 
 def define_common_bert_flags():
@@ -24,15 +27,19 @@ def define_common_bert_flags():
   flags.DEFINE_string('model_dir', None, (
       'The directory where the model weights and training/evaluation summaries '
       'are stored. If not specified, save to /tmp/bert20/.'))
+  flags.DEFINE_string(
+      'model_export_path', None,
+      'Path to the directory, where trainined model will be '
+      'exported.')
   flags.DEFINE_string('tpu', '', 'TPU address to connect to.')
   flags.DEFINE_string(
       'init_checkpoint', None,
       'Initial checkpoint (usually from a pre-trained BERT model).')
   flags.DEFINE_enum(
-      'strategy_type', 'mirror', ['tpu', 'mirror'],
+      'strategy_type', 'mirror', ['tpu', 'mirror', 'multi_worker_mirror'],
       'Distribution Strategy type to use for training. `tpu` uses '
-      'TPUStrategy for running on TPUs, `mirror` uses GPUs with '
-      'single host.')
+      'TPUStrategy for running on TPUs, `mirror` uses GPUs with single host, '
+      '`multi_worker_mirror` uses CPUs or GPUs with multiple hosts.')
   flags.DEFINE_integer('num_train_epochs', 3,
                        'Total number of training epochs to perform.')
   flags.DEFINE_integer(
@@ -42,3 +49,34 @@ def define_common_bert_flags():
       'inside.')
   flags.DEFINE_float('learning_rate', 5e-5,
                      'The initial learning rate for Adam.')
+  flags.DEFINE_boolean(
+      'run_eagerly', False,
+      'Run the model op by op without building a model function.')
+  flags.DEFINE_boolean(
+      'scale_loss', False,
+      'Whether to divide the loss by number of replica inside the per-replica '
+      'loss function.')
+
+  # Adds flags for mixed precision training.
+  flags_core.define_performance(
+      num_parallel_calls=False,
+      inter_op=False,
+      intra_op=False,
+      synthetic_data=False,
+      max_train_steps=False,
+      dtype=True,
+      dynamic_loss_scale=True,
+      loss_scale=True,
+      all_reduce_alg=False,
+      num_packs=False,
+      enable_xla=True,
+      fp16_implementation=True,
+  )
+
+
+def use_float16():
+  return flags_core.get_tf_dtype(flags.FLAGS) == tf.float16
+
+
+def get_loss_scale():
+  return flags_core.get_loss_scale(flags.FLAGS, default_for_fp16='dynamic')

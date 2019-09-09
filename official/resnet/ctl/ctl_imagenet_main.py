@@ -18,39 +18,20 @@ from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
 
-import os
-import tempfile
-import datetime
-import time
-import numpy as np
-
 from absl import app as absl_app
 from absl import flags
 from absl import logging
-
 import tensorflow as tf
 
-from official.resnet import imagenet_main
-from official.resnet.keras import keras_common
-from official.resnet.keras import keras_imagenet_main
-from official.resnet.keras import resnet_model
+from official.resnet.ctl import ctl_common
+from official.vision.image_classification import imagenet_preprocessing
+from official.vision.image_classification import common
+from official.vision.image_classification import resnet_model
 from official.utils.flags import core as flags_core
 from official.utils.logs import logger
 from official.utils.misc import distribution_utils
-from official.utils.misc import model_helpers
-from official.resnet.ctl import ctl_common
 from official.utils.misc import keras_utils
-
-
-def parse_record_keras(raw_record, is_training, dtype):
-  """Adjust the shape of label."""
-  image, label = imagenet_main.parse_record(raw_record, is_training, dtype)
-
-  # Subtract one so that labels are in [0, 1000), and cast to float32 for
-  # Keras model.
-  label = tf.cast(tf.cast(tf.reshape(label, shape=[1]), dtype=tf.int32) - 1,
-                  dtype=tf.float32)
-  return image, label
+from official.utils.misc import model_helpers
 
 
 def build_stats(train_result, eval_result, time_callback):
@@ -68,18 +49,18 @@ def build_stats(train_result, eval_result, time_callback):
   stats = {}
 
   if eval_result:
-    stats["eval_loss"] = eval_result[0]
-    stats["eval_acc"] = eval_result[1]
+    stats['eval_loss'] = eval_result[0]
+    stats['eval_acc'] = eval_result[1]
 
     stats['train_loss'] = train_result[0]
     stats['train_acc'] = train_result[1]
 
   if time_callback:
     timestamp_log = time_callback.timestamp_log
-    stats["step_timestamp_log"] = timestamp_log
-    stats["train_finish_time"] = time_callback.train_finish_time
+    stats['step_timestamp_log'] = timestamp_log
+    stats['train_finish_time'] = time_callback.train_finish_time
     if len(timestamp_log) > 1:
-      stats["avg_exp_per_second"] = (
+      stats['avg_exp_per_second'] = (
           time_callback.batch_size * time_callback.log_steps *
           (len(time_callback.timestamp_log) - 1) /
           (timestamp_log[-1].timestamp - timestamp_log[0].timestamp))
@@ -91,21 +72,21 @@ def get_input_dataset(flags_obj, strategy):
   """Returns the test and train input datasets."""
   dtype = flags_core.get_tf_dtype(flags_obj)
   if flags_obj.use_synthetic_data:
-    input_fn = keras_common.get_synth_input_fn(
-        height=imagenet_main.DEFAULT_IMAGE_SIZE,
-        width=imagenet_main.DEFAULT_IMAGE_SIZE,
-        num_channels=imagenet_main.NUM_CHANNELS,
-        num_classes=imagenet_main.NUM_CLASSES,
+    input_fn = common.get_synth_input_fn(
+        height=imagenet_preprocessing.DEFAULT_IMAGE_SIZE,
+        width=imagenet_preprocessing.DEFAULT_IMAGE_SIZE,
+        num_channels=imagenet_preprocessing.NUM_CHANNELS,
+        num_classes=imagenet_preprocessing.NUM_CLASSES,
         dtype=dtype,
         drop_remainder=True)
   else:
-    input_fn = imagenet_main.input_fn
+    input_fn = imagenet_preprocessing.input_fn
 
   train_ds = input_fn(
       is_training=True,
       data_dir=flags_obj.data_dir,
       batch_size=flags_obj.batch_size,
-      parse_record_fn=parse_record_keras,
+      parse_record_fn=imagenet_preprocessing.parse_record,
       datasets_num_private_threads=flags_obj.datasets_num_private_threads,
       dtype=dtype)
 
@@ -118,7 +99,7 @@ def get_input_dataset(flags_obj, strategy):
         is_training=False,
         data_dir=flags_obj.data_dir,
         batch_size=flags_obj.batch_size,
-        parse_record_fn=parse_record_keras,
+        parse_record_fn=imagenet_preprocessing.parse_record,
         dtype=dtype)
 
     if strategy:
@@ -129,14 +110,16 @@ def get_input_dataset(flags_obj, strategy):
 
 def get_num_train_iterations(flags_obj):
   """Returns the number of training stesps, train and test epochs."""
-  train_steps = imagenet_main.NUM_IMAGES['train'] // flags_obj.batch_size
+  train_steps = (
+      imagenet_preprocessing.NUM_IMAGES['train'] // flags_obj.batch_size)
   train_epochs = flags_obj.train_epochs
 
   if flags_obj.train_steps:
     train_steps = min(flags_obj.train_steps, train_steps)
     train_epochs = 1
 
-  eval_steps = imagenet_main.NUM_IMAGES['validation'] // flags_obj.batch_size
+  eval_steps = (
+      imagenet_preprocessing.NUM_IMAGES['validation'] // flags_obj.batch_size)
 
   return train_steps, train_epochs, eval_steps
 
@@ -153,7 +136,9 @@ def run(flags_obj):
   Returns:
     Dictionary of training and eval stats.
   """
-  dtype = flags_core.get_tf_dtype(flags_obj)
+  keras_utils.set_session_config(
+      enable_eager=flags_obj.enable_eager,
+      enable_xla=flags_obj.enable_xla)
 
   # TODO(anj-s): Set data_format without using Keras.
   data_format = flags_obj.data_format
@@ -177,18 +162,30 @@ def run(flags_obj):
 
   strategy_scope = distribution_utils.get_strategy_scope(strategy)
   with strategy_scope:
-    model = resnet_model.resnet50(num_classes=imagenet_main.NUM_CLASSES,
-                                  dtype=dtype, batch_size=flags_obj.batch_size)
+    model = resnet_model.resnet50(
+        num_classes=imagenet_preprocessing.NUM_CLASSES,
+        batch_size=flags_obj.batch_size,
+        use_l2_regularizer=not flags_obj.single_l2_loss_op)
 
     optimizer = tf.keras.optimizers.SGD(
-        learning_rate=keras_common.BASE_LEARNING_RATE, momentum=0.9,
+        learning_rate=common.BASE_LEARNING_RATE, momentum=0.9,
         nesterov=True)
+
+    if flags_obj.fp16_implementation == "graph_rewrite":
+      if not flags_obj.use_tf_function:
+        raise ValueError("--fp16_implementation=graph_rewrite requires "
+                         "--use_tf_function to be true")
+      loss_scale = flags_core.get_loss_scale(flags_obj, default_for_fp16=128)
+      optimizer = tf.train.experimental.enable_mixed_precision_graph_rewrite(
+          optimizer, loss_scale)
 
     training_accuracy = tf.keras.metrics.SparseCategoricalAccuracy(
         'training_accuracy', dtype=tf.float32)
     test_loss = tf.keras.metrics.Mean('test_loss', dtype=tf.float32)
     test_accuracy = tf.keras.metrics.SparseCategoricalAccuracy(
         'test_accuracy', dtype=tf.float32)
+
+    trainable_variables = model.trainable_variables
 
     def train_step(train_ds_inputs):
       """Training StepFn."""
@@ -200,13 +197,32 @@ def run(flags_obj):
 
           prediction_loss = tf.keras.losses.sparse_categorical_crossentropy(
               labels, logits)
-          loss1 = tf.reduce_sum(prediction_loss) * (1.0/ flags_obj.batch_size)
-          loss2 = (tf.reduce_sum(model.losses) /
-                   tf.distribute.get_strategy().num_replicas_in_sync)
-          loss = loss1 + loss2
+          loss = tf.reduce_sum(prediction_loss) * (1.0/ flags_obj.batch_size)
+          num_replicas = tf.distribute.get_strategy().num_replicas_in_sync
 
-        grads = tape.gradient(loss, model.trainable_variables)
-        optimizer.apply_gradients(zip(grads, model.trainable_variables))
+          if flags_obj.single_l2_loss_op:
+            filtered_variables = [
+                tf.reshape(v, (-1,))
+                for v in trainable_variables
+                if 'bn' not in v.name
+            ]
+            l2_loss = resnet_model.L2_WEIGHT_DECAY * 2 * tf.nn.l2_loss(
+                tf.concat(filtered_variables, axis=0))
+            loss += (l2_loss / num_replicas)
+          else:
+            loss += (tf.reduce_sum(model.losses) / num_replicas)
+
+          # Scale the loss
+          if flags_obj.dtype == "fp16":
+            loss = optimizer.get_scaled_loss(loss)
+
+        grads = tape.gradient(loss, trainable_variables)
+
+        # Unscale the grads
+        if flags_obj.dtype == "fp16":
+          grads = optimizer.get_unscaled_gradients(grads)
+
+        optimizer.apply_gradients(zip(grads, trainable_variables))
 
         training_accuracy.update_state(labels, logits)
         return loss
@@ -247,7 +263,7 @@ def run(flags_obj):
       training_accuracy.reset_states()
 
       for step in range(train_steps):
-        optimizer.lr = keras_imagenet_main.learning_rate_schedule(
+        optimizer.lr = common.learning_rate_schedule(
             epoch, step, train_steps, flags_obj.batch_size)
 
         time_callback.on_batch_begin(step+epoch*train_steps)
@@ -296,6 +312,7 @@ def main(_):
 
 if __name__ == '__main__':
   logging.set_verbosity(logging.INFO)
-  imagenet_main.define_imagenet_flags()
+  common.define_keras_flags()
   ctl_common.define_ctl_flags()
+  flags.adopt_module_key_flags(ctl_common)
   absl_app.run(main)

@@ -47,8 +47,14 @@ flags.DEFINE_integer("num_train_epochs", 14,
 flags.DEFINE_integer(
     "num_negative_samples", 4,
     "Number of negative instances to pair with positive instance.")
-flags.DEFINE_integer("prebatch_size", 99000,
-                     "Batch size to be used for prebatching the dataset.")
+flags.DEFINE_integer(
+    "train_prebatch_size", 99000,
+    "Batch size to be used for prebatching the dataset "
+    "for training.")
+flags.DEFINE_integer(
+    "eval_prebatch_size", 99000,
+    "Batch size to be used for prebatching the dataset "
+    "for training.")
 
 FLAGS = flags.FLAGS
 
@@ -59,8 +65,8 @@ def prepare_raw_data(flag_obj):
 
   data_processing_params = {
       "train_epochs": flag_obj.num_train_epochs,
-      "batch_size": flag_obj.prebatch_size,
-      "eval_batch_size": flag_obj.prebatch_size,
+      "batch_size": flag_obj.train_prebatch_size,
+      "eval_batch_size": flag_obj.eval_prebatch_size,
       "batches_per_step": 1,
       "stream_files": True,
       "num_neg": flag_obj.num_negative_samples,
@@ -82,7 +88,10 @@ def prepare_raw_data(flag_obj):
       "num_train_elements": producer._elements_in_epoch,
       "num_eval_elements": producer._eval_elements_in_epoch,
       "num_train_epochs": flag_obj.num_train_epochs,
-      "prebatch_size": flag_obj.prebatch_size,
+      "train_prebatch_size": flag_obj.train_prebatch_size,
+      "eval_prebatch_size": flag_obj.eval_prebatch_size,
+      "num_train_steps": producer.train_batches_per_epoch,
+      "num_eval_steps": producer.eval_batches_per_epoch,
   }
   # pylint: enable=protected-access
 

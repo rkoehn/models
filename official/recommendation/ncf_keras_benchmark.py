@@ -31,6 +31,7 @@ from official.utils.flags import core
 
 FLAGS = flags.FLAGS
 NCF_DATA_DIR_NAME = 'movielens_data'
+NCF_TF_DATA_1M_BATCH_DIR_NAME = 'gs://tf-perfzero-data/movielens_data/ncf_8gpu_1M_batch'
 
 
 class NCFKerasBenchmarkBase(tf.test.Benchmark):
@@ -46,6 +47,7 @@ class NCFKerasBenchmarkBase(tf.test.Benchmark):
 
   def _setup(self):
     """Sets up and resets flags before each test."""
+    assert tf.version.VERSION.startswith('2.')
     tf.compat.v1.logging.set_verbosity(tf.compat.v1.logging.DEBUG)
     if NCFKerasBenchmarkBase.local_flags is None:
       ncf_common.define_ncf_flags()
@@ -57,16 +59,25 @@ class NCFKerasBenchmarkBase(tf.test.Benchmark):
     else:
       flagsaver.restore_flag_values(NCFKerasBenchmarkBase.local_flags)
 
-  def _run_and_report_benchmark(self):
+  def _run_and_report_benchmark(self, hr_at_10_min=0, hr_at_10_max=0):
     start_time_sec = time.time()
     stats = ncf_keras_main.run_ncf(FLAGS)
     wall_time_sec = time.time() - start_time_sec
 
-    metrics = self._extract_benchmark_report_extras(stats)
-    self.report_benchmark(iters=-1, wall_time=wall_time_sec, metrics=metrics)
+    metrics = []
+    metrics.append({'name': 'exp_per_second',
+                    'value': stats['avg_exp_per_second']})
 
-  def _extract_benchmark_report_extras(self, stats):
-    raise NotImplementedError('Not implemented')
+    if hr_at_10_min > 0:
+      metrics.append({'name': 'hr_at_10',
+                      'value': stats['eval_hit_rate'],
+                      'min_value': hr_at_10_min,
+                      'max_value': hr_at_10_max})
+
+      metrics.append({'name': 'train_loss',
+                      'value': stats['loss']})
+
+    self.report_benchmark(iters=-1, wall_time=wall_time_sec, metrics=metrics)
 
 
 class NCFKerasAccuracy(NCFKerasBenchmarkBase):
@@ -100,32 +111,50 @@ class NCFKerasAccuracy(NCFKerasBenchmarkBase):
         default_flags=default_flags,
         **kwargs)
 
-  def _extract_benchmark_report_extras(self, stats):
-    metrics = []
-    metrics.append({'name': 'exp_per_second',
-                    'value': stats['avg_exp_per_second']})
+  def _run_and_report_benchmark_mlperf_like(self):
+    """Run test and report results.
 
-    # Target is 0.635, but some runs are below that level. Until we have
-    # multi-run tests, we have to accept a lower target.
-    metrics.append({'name': 'hr_at_10',
-                    'value': stats['eval_hit_rate'],
-                    'min_value': 0.630,
-                    'max_value': 0.640})
+    Note: MLPerf like tests are not tuned to hit a specific hr@10 value, but
+    we want it recorded.
+    """
+    self._run_and_report_benchmark(hr_at_10_min=0.61)
 
-    metrics.append({'name': 'train_loss',
-                    'value': stats['loss']})
+  def _run_and_report_benchmark(self, hr_at_10_min=0.630, hr_at_10_max=0.645):
+    """Run test and report results.
 
-    return metrics
+    Note: Target is 0.635, but some runs are below that level. Until we have
+    multi-run tests, we have to accept a lower target.
+
+    Args:
+      hr_at_10_min: Minimum acceptable hr@10 value.
+      hr_at_10_max: Maximum acceptable hr@10 value.
+    """
+    super(NCFKerasAccuracy, self)._run_and_report_benchmark(
+        hr_at_10_min=hr_at_10_min,
+        hr_at_10_max=hr_at_10_max)
 
   def benchmark_1_gpu_early_stop(self):
     self._setup()
     FLAGS.early_stopping = True
     self._run_and_report_benchmark()
 
+  def benchmark_1_gpu_force_v1_path_early_stop(self):
+    self._setup()
+    FLAGS.early_stopping = True
+    FLAGS.force_v2_in_keras_compile = False
+    self._run_and_report_benchmark()
+
   def benchmark_1_gpu_no_dist_strat_early_stop(self):
     self._setup()
     FLAGS.distribution_strategy = 'off'
     FLAGS.early_stopping = True
+    self._run_and_report_benchmark()
+
+  def benchmark_1_gpu_no_dist_strat_force_v1_path_early_stop(self):
+    self._setup()
+    FLAGS.distribution_strategy = 'off'
+    FLAGS.early_stopping = True
+    FLAGS.force_v2_in_keras_compile = False
     self._run_and_report_benchmark()
 
   def benchmark_1_gpu_no_dist_strat_run_eagerly_early_stop(self):
@@ -141,10 +170,24 @@ class NCFKerasAccuracy(NCFKerasBenchmarkBase):
     FLAGS.enable_xla = True
     self._run_and_report_benchmark()
 
+  def benchmark_xla_1_gpu_force_v1_path_early_stop(self):
+    self._setup()
+    FLAGS.early_stopping = True
+    FLAGS.enable_xla = True
+    FLAGS.force_v2_in_keras_compile = False
+    self._run_and_report_benchmark()
+
   def benchmark_1_gpu_ctl_early_stop(self):
     self._setup()
     FLAGS.keras_use_ctl = True
     FLAGS.early_stopping = True
+    self._run_and_report_benchmark()
+
+  def benchmark_1_gpu_ctl_run_eagerly_early_stop(self):
+    self._setup()
+    FLAGS.keras_use_ctl = True
+    FLAGS.early_stopping = True
+    FLAGS.run_eagerly = True
     self._run_and_report_benchmark()
 
   def benchmark_xla_1_gpu_ctl_early_stop(self):
@@ -158,6 +201,7 @@ class NCFKerasAccuracy(NCFKerasBenchmarkBase):
     self._setup()
     FLAGS.early_stopping = True
     FLAGS.num_gpus = 2
+    FLAGS.eval_batch_size = 160000
     self._run_and_report_benchmark()
 
   def benchmark_2_gpus_ctl_early_stop(self):
@@ -166,10 +210,11 @@ class NCFKerasAccuracy(NCFKerasBenchmarkBase):
     FLAGS.keras_use_ctl = True
     FLAGS.early_stopping = True
     FLAGS.num_gpus = 2
+    FLAGS.eval_batch_size = 160000
     self._run_and_report_benchmark()
 
 #############################################
-# Tests below with mlperf in the test name are of two types
+# Tests below with mlperf in the test name are of two types:
 #  1) 1 GPU tests are based on MLPerf 0.5 and the TensorFlow pulled submission.
 #  2) 8 GPU tests are based on MLPerf 0.5 and use NVIDIA's hyper parameters.
 #
@@ -182,6 +227,14 @@ class NCFKerasAccuracy(NCFKerasBenchmarkBase):
     """1 GPU using keras fit/compile."""
     self._setup()
     FLAGS.train_epochs = 7
+    self._run_and_report_benchmark_mlperf_like()
+
+  def benchmark_1_gpu_no_dist_strat_force_v1_path_mlperf_like(self):
+    """1 GPU using compile/fit without dist_strat."""
+    self._setup()
+    FLAGS.train_epochs = 7
+    FLAGS.distribution_strategy = 'off'
+    FLAGS.force_v2_in_keras_compile = False
     self._run_and_report_benchmark()
 
   def benchmark_1_gpu_no_dist_strat_mlperf_like(self):
@@ -189,27 +242,43 @@ class NCFKerasAccuracy(NCFKerasBenchmarkBase):
     self._setup()
     FLAGS.train_epochs = 7
     FLAGS.distribution_strategy = 'off'
-    self._run_and_report_benchmark()
+    self._run_and_report_benchmark_mlperf_like()
 
   def benchmark_1_gpu_no_dist_strat_run_eagerly_mlperf_like(self):
-    """1 GPU using compile/fit without dist_strat and force run eager."""
     self._setup()
     FLAGS.train_epochs = 7
     FLAGS.distribution_strategy = 'off'
     FLAGS.run_eagerly = True
-    self._run_and_report_benchmark()
+    self._run_and_report_benchmark_mlperf_like()
 
   def benchmark_xla_1_gpu_mlperf_like(self):
     """1 GPU using compile/fit with XLA."""
     self._setup()
     FLAGS.train_epochs = 7
     FLAGS.enable_xla = True
-    self._run_and_report_benchmark()
+    self._run_and_report_benchmark_mlperf_like()
 
   def benchmark_1_gpu_ctl_mlperf_like(self):
     """1 GPU using CTL."""
     self._setup()
     FLAGS.keras_use_ctl = True
+    FLAGS.train_epochs = 7
+    self._run_and_report_benchmark_mlperf_like()
+
+  def benchmark_1_gpu_ctl_fp16_mlperf_like(self):
+    """1 GPU using CTL."""
+    self._setup()
+    FLAGS.keras_use_ctl = True
+    FLAGS.train_epochs = 7
+    FLAGS.dtype = 'fp16'
+    FLAGS.loss_scale = 8192
+    self._run_and_report_benchmark_mlperf_like()
+
+  def benchmark_1_gpu_ctl_run_eagerly_mlperf_like(self):
+    """1 GPU using CTL with eager and distribution strategy."""
+    self._setup()
+    FLAGS.keras_use_ctl = True
+    FLAGS.run_eagerly = True
     FLAGS.train_epochs = 7
     self._run_and_report_benchmark()
 
@@ -219,7 +288,17 @@ class NCFKerasAccuracy(NCFKerasBenchmarkBase):
     FLAGS.keras_use_ctl = True
     FLAGS.enable_xla = True
     FLAGS.train_epochs = 7
-    self._run_and_report_benchmark()
+    self._run_and_report_benchmark_mlperf_like()
+
+  def benchmark_xla_1_gpu_ctl_fp16_mlperf_like(self):
+    """1 GPU using CTL with XLA."""
+    self._setup()
+    FLAGS.keras_use_ctl = True
+    FLAGS.enable_xla = True
+    FLAGS.train_epochs = 7
+    FLAGS.dtype = 'fp16'
+    FLAGS.loss_scale = 8192
+    self._run_and_report_benchmark_mlperf_like()
 
   def benchmark_8_gpu_mlperf_like(self):
     """8 GPU using keras fit/compile."""
@@ -227,24 +306,26 @@ class NCFKerasAccuracy(NCFKerasBenchmarkBase):
     FLAGS.num_gpus = 8
     FLAGS.train_epochs = 17
     FLAGS.batch_size = 1048576
+    FLAGS.eval_batch_size = 160000
     FLAGS.learning_rate = 0.0045
     FLAGS.beta1 = 0.25
     FLAGS.beta2 = 0.5
     FLAGS.epsilon = 1e-8
-    self._run_and_report_benchmark()
+    self._run_and_report_benchmark_mlperf_like()
 
-  def benchmark_xla_8_gpu_mlperf_like(self):
-    """8 GPU using keras fit/compile with XLA."""
+  def benchmark_8_gpu_force_v1_path_mlperf_like(self):
+    """8 GPU using keras fit/compile v1 codepath."""
     self._setup()
     FLAGS.num_gpus = 8
-    FLAGS.enable_xla = True
     FLAGS.train_epochs = 17
     FLAGS.batch_size = 1048576
+    FLAGS.eval_batch_size = 160000
     FLAGS.learning_rate = 0.0045
     FLAGS.beta1 = 0.25
     FLAGS.beta2 = 0.5
     FLAGS.epsilon = 1e-8
-    self._run_and_report_benchmark()
+    FLAGS.force_v2_in_keras_compile = False
+    self._run_and_report_benchmark_mlperf_like()
 
   def benchmark_8_gpu_ctl_mlperf_like(self):
     """8 GPU using CTL."""
@@ -253,26 +334,48 @@ class NCFKerasAccuracy(NCFKerasBenchmarkBase):
     FLAGS.num_gpus = 8
     FLAGS.train_epochs = 17
     FLAGS.batch_size = 1048576
+    FLAGS.eval_batch_size = 160000
     FLAGS.learning_rate = 0.0045
     FLAGS.beta1 = 0.25
     FLAGS.beta2 = 0.5
     FLAGS.epsilon = 1e-8
-    self._run_and_report_benchmark()
+    self._run_and_report_benchmark_mlperf_like()
 
-  def benchmark_xla_8_gpu_ctl_mlperf_like(self):
-    """8 GPU using CTL with XLA."""
+  def benchmark_8_gpu_tf_data_ctl_mlperf_like(self):
+    """8 GPU using CTL."""
     self._setup()
     FLAGS.keras_use_ctl = True
-    FLAGS.enable_xla = True
     FLAGS.num_gpus = 8
     FLAGS.train_epochs = 17
     FLAGS.batch_size = 1048576
+    FLAGS.eval_batch_size = 1048000
     FLAGS.learning_rate = 0.0045
     FLAGS.beta1 = 0.25
     FLAGS.beta2 = 0.5
     FLAGS.epsilon = 1e-8
-    self._run_and_report_benchmark()
+    FLAGS.train_dataset_path = os.path.join(NCF_TF_DATA_1M_BATCH_DIR_NAME, "training_cycle_*/*")
+    FLAGS.eval_dataset_path = os.path.join(NCF_TF_DATA_1M_BATCH_DIR_NAME, "eval_data/*")
+    FLAGS.input_meta_data_path = os.path.join(NCF_TF_DATA_1M_BATCH_DIR_NAME, "meta_data.json")
+    self._run_and_report_benchmark_mlperf_like()
 
+  def benchmark_8_gpu_tf_data_ctl_fp16_mlperf_like(self):
+    """8 GPU using CTL."""
+    self._setup()
+    FLAGS.keras_use_ctl = True
+    FLAGS.num_gpus = 8
+    FLAGS.train_epochs = 17
+    FLAGS.batch_size = 1048576
+    FLAGS.eval_batch_size = 1048000
+    FLAGS.learning_rate = 0.0045
+    FLAGS.beta1 = 0.25
+    FLAGS.beta2 = 0.5
+    FLAGS.epsilon = 1e-8
+    FLAGS.dtype = 'fp16'
+    FLAGS.loss_scale = 8192
+    FLAGS.train_dataset_path = os.path.join(NCF_TF_DATA_1M_BATCH_DIR_NAME, "training_cycle_*/*")
+    FLAGS.eval_dataset_path = os.path.join(NCF_TF_DATA_1M_BATCH_DIR_NAME, "eval_data/*")
+    FLAGS.input_meta_data_path = os.path.join(NCF_TF_DATA_1M_BATCH_DIR_NAME, "meta_data.json")
+    self._run_and_report_benchmark_mlperf_like()
 
 class NCFKerasSynth(NCFKerasBenchmarkBase):
   """Benchmark NCF model using synthetic data."""
@@ -287,6 +390,7 @@ class NCFKerasSynth(NCFKerasBenchmarkBase):
     default_flags['num_gpus'] = 1
     default_flags['train_epochs'] = 8
     default_flags['batch_size'] = 99000
+    default_flags['eval_batch_size'] = 160000
     default_flags['learning_rate'] = 0.00382059
     default_flags['beta1'] = 0.783529
     default_flags['beta2'] = 0.909003
@@ -301,12 +405,6 @@ class NCFKerasSynth(NCFKerasBenchmarkBase):
         default_flags=default_flags,
         **kwargs)
 
-  def _extract_benchmark_report_extras(self, stats):
-    metrics = []
-    metrics.append({'name': 'exp_per_second',
-                    'value': stats['avg_exp_per_second']})
-    return metrics
-
   def benchmark_1_gpu(self):
     self._setup()
     self._run_and_report_benchmark()
@@ -315,3 +413,7 @@ class NCFKerasSynth(NCFKerasBenchmarkBase):
     self._setup()
     FLAGS.num_gpus = 2
     self._run_and_report_benchmark()
+
+
+if __name__ == '__main__':
+  tf.test.main()

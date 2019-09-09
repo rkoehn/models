@@ -23,16 +23,11 @@ import os
 
 from absl import logging
 import tensorflow as tf
+from official.utils.misc import distribution_utils
+from official.utils.misc import tpu_lib
 
 _SUMMARY_TXT = 'training_summary.txt'
 _MIN_SUMMARY_STEPS = 10
-
-
-def get_primary_cpu_task(use_remote_tpu=False):
-  """Returns primary CPU task to which input pipeline Ops are put."""
-
-  # Remote Eager Borg job configures the TPU worker with job name 'worker'.
-  return '/job:worker' if use_remote_tpu else ''
 
 
 def _save_checkpoint(checkpoint, model_dir, checkpoint_prefix):
@@ -193,10 +188,10 @@ def run_customized_training_loop(
 
   # To reduce unnecessary send/receive input pipeline operation, we place input
   # pipeline ops in worker task.
-  with tf.device(get_primary_cpu_task(use_remote_tpu)):
+  with tf.device(tpu_lib.get_primary_cpu_task(use_remote_tpu)):
     train_iterator = _get_input_iterator(train_input_fn, strategy)
 
-    with strategy.scope():
+    with distribution_utils.get_strategy_scope(strategy):
       # To correctly place the model weights on accelerators,
       # model and optimizer should be created in scope.
       model, sub_model = model_fn()
@@ -204,6 +199,8 @@ def run_customized_training_loop(
         raise ValueError('User should set optimizer attribute to model '
                          'inside `model_fn`.')
       optimizer = model.optimizer
+      use_float16 = isinstance(
+          optimizer, tf.keras.mixed_precision.experimental.LossScaleOptimizer)
 
       if init_checkpoint:
         logging.info(
@@ -234,17 +231,25 @@ def run_customized_training_loop(
       else:
         train_summary_writer = None
 
+      # Collects training variables.
+      training_vars = model.trainable_variables
+
       def _replicated_step(inputs):
         """Replicated training step."""
 
         inputs, labels = inputs
         with tf.GradientTape() as tape:
-          model_outputs = model(inputs)
+          model_outputs = model(inputs, training=True)
           loss = loss_fn(labels, model_outputs)
+          if use_float16:
+            scaled_loss = optimizer.get_scaled_loss(loss)
 
-        tvars = model.trainable_variables
-        grads = tape.gradient(loss, tvars)
-        optimizer.apply_gradients(zip(grads, tvars))
+        if use_float16:
+          scaled_grads = tape.gradient(scaled_loss, training_vars)
+          grads = optimizer.get_unscaled_gradients(scaled_grads)
+        else:
+          grads = tape.gradient(loss, training_vars)
+        optimizer.apply_gradients(zip(grads, training_vars))
         # For reporting, the metric takes the mean of losses.
         train_loss_metric.update_state(loss)
         for metric in train_metrics:
@@ -408,7 +413,7 @@ def run_customized_training_loop(
         # TODO(hongkuny): Cleans up summary reporting in text.
         training_summary['last_train_metrics'] = _float_metric_value(
             train_metrics[0])
-        training_summary['eval_metricss'] = _float_metric_value(eval_metrics[0])
+        training_summary['eval_metrics'] = _float_metric_value(eval_metrics[0])
 
       _write_txt_summary(training_summary, model_dir)
 

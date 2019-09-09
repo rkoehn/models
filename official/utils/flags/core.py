@@ -32,6 +32,7 @@ from official.utils.flags import _base
 from official.utils.flags import _benchmark
 from official.utils.flags import _conventions
 from official.utils.flags import _device
+from official.utils.flags import _distribution
 from official.utils.flags import _misc
 from official.utils.flags import _performance
 
@@ -71,12 +72,13 @@ def register_key_flags_in_core(f):
 define_base = register_key_flags_in_core(_base.define_base)
 # Remove options not relevant for Eager from define_base().
 define_base_eager = register_key_flags_in_core(functools.partial(
-    _base.define_base, epochs_between_evals=False, stop_threshold=False,
-    hooks=False))
+    _base.define_base, stop_threshold=False, hooks=False))
 define_benchmark = register_key_flags_in_core(_benchmark.define_benchmark)
 define_device = register_key_flags_in_core(_device.define_device)
 define_image = register_key_flags_in_core(_misc.define_image)
 define_performance = register_key_flags_in_core(_performance.define_performance)
+define_distribution = register_key_flags_in_core(
+    _distribution.define_distribution)
 
 
 help_wrap = _conventions.help_wrap

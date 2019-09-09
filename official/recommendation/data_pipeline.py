@@ -125,13 +125,16 @@ class DatasetManager(object):
     return tf.train.Example(
         features=tf.train.Features(feature=feature_dict)).SerializeToString()
 
-  def deserialize(self, serialized_data, batch_size):
+  @staticmethod
+  def deserialize(serialized_data, batch_size=None, is_training=True):
     """Convert serialized TFRecords into tensors.
 
     Args:
       serialized_data: A tensor containing serialized records.
       batch_size: The data arrives pre-batched, so batch size is needed to
         deserialize the data.
+      is_training: Boolean, whether data to deserialize to training data
+        or evaluation data.
     """
 
     def _get_feature_map(batch_size, is_training=True):
@@ -140,52 +143,56 @@ class DatasetManager(object):
       if is_training:
         return {
             movielens.USER_COLUMN:
-                tf.io.FixedLenFeature([batch_size], dtype=tf.int64),
+                tf.io.FixedLenFeature([batch_size, 1], dtype=tf.int64),
             movielens.ITEM_COLUMN:
-                tf.io.FixedLenFeature([batch_size], dtype=tf.int64),
+                tf.io.FixedLenFeature([batch_size, 1], dtype=tf.int64),
             rconst.VALID_POINT_MASK:
-                tf.io.FixedLenFeature([batch_size], dtype=tf.int64),
+                tf.io.FixedLenFeature([batch_size, 1], dtype=tf.int64),
             "labels":
-                tf.io.FixedLenFeature([batch_size], dtype=tf.int64)
+                tf.io.FixedLenFeature([batch_size, 1], dtype=tf.int64)
         }
       else:
         return {
             movielens.USER_COLUMN:
-                tf.io.FixedLenFeature([batch_size], dtype=tf.int64),
+                tf.io.FixedLenFeature([batch_size, 1], dtype=tf.int64),
             movielens.ITEM_COLUMN:
-                tf.io.FixedLenFeature([batch_size], dtype=tf.int64),
+                tf.io.FixedLenFeature([batch_size, 1], dtype=tf.int64),
             rconst.DUPLICATE_MASK:
-                tf.io.FixedLenFeature([batch_size], dtype=tf.int64)
+                tf.io.FixedLenFeature([batch_size, 1], dtype=tf.int64)
         }
 
-    features = tf.parse_single_example(
-        serialized_data, _get_feature_map(batch_size, self._is_training))
-    users = tf.reshape(
-        tf.cast(features[movielens.USER_COLUMN], rconst.USER_DTYPE),
-        (batch_size,))
-    items = tf.reshape(
-        tf.cast(features[movielens.ITEM_COLUMN], rconst.ITEM_DTYPE),
-        (batch_size,))
+    features = tf.io.parse_single_example(
+        serialized_data, _get_feature_map(batch_size, is_training=is_training))
+    users = tf.cast(features[movielens.USER_COLUMN], rconst.USER_DTYPE)
+    items = tf.cast(features[movielens.ITEM_COLUMN], rconst.ITEM_DTYPE)
 
-    if self._is_training:
-      valid_point_mask = tf.reshape(
-          tf.cast(features[movielens.ITEM_COLUMN], tf.bool), (batch_size,))
+    if is_training:
+      valid_point_mask = tf.cast(features[rconst.VALID_POINT_MASK], tf.bool)
+      fake_dup_mask = tf.zeros_like(users)
       return {
           movielens.USER_COLUMN: users,
           movielens.ITEM_COLUMN: items,
           rconst.VALID_POINT_MASK: valid_point_mask,
-      }, tf.reshape(tf.cast(features["labels"], tf.bool), (batch_size,))
-
-    return {
-        movielens.USER_COLUMN:
-            users,
-        movielens.ITEM_COLUMN:
-            items,
-        rconst.DUPLICATE_MASK:
-            tf.reshape(
-                tf.cast(features[rconst.DUPLICATE_MASK], tf.bool),
-                (batch_size,))
-    }
+          rconst.TRAIN_LABEL_KEY:
+              tf.reshape(tf.cast(features["labels"], tf.bool),
+                         (batch_size, 1)),
+          rconst.DUPLICATE_MASK: fake_dup_mask
+      }
+    else:
+      labels = tf.cast(tf.zeros_like(users), tf.bool)
+      fake_valid_pt_mask = tf.cast(tf.zeros_like(users), tf.bool)
+      return {
+          movielens.USER_COLUMN:
+              users,
+          movielens.ITEM_COLUMN:
+              items,
+          rconst.DUPLICATE_MASK:
+              tf.cast(features[rconst.DUPLICATE_MASK], tf.bool),
+          rconst.VALID_POINT_MASK:
+              fake_valid_pt_mask,
+          rconst.TRAIN_LABEL_KEY:
+              labels
+      }
 
   def put(self, index, data):
     # type: (int, dict) -> None
@@ -204,8 +211,8 @@ class DatasetManager(object):
     if self._is_training:
       mask_start_index = data.pop(rconst.MASK_START_INDEX)
       batch_size = data[movielens.ITEM_COLUMN].shape[0]
-      data[rconst.VALID_POINT_MASK] = np.less(
-          np.arange(batch_size), mask_start_index)
+      data[rconst.VALID_POINT_MASK] = np.expand_dims(
+          np.less(np.arange(batch_size), mask_start_index), -1)
 
     if self._stream_files:
       example_bytes = self.serialize(data)
@@ -287,25 +294,30 @@ class DatasetManager(object):
           files=file_pattern, worker_job=popen_helper.worker_job(),
           num_parallel_reads=rconst.NUM_FILE_SHARDS, num_epochs=1,
           sloppy=not self._deterministic)
-      map_fn = functools.partial(self.deserialize, batch_size=batch_size)
+      map_fn = functools.partial(
+          self.deserialize,
+          batch_size=batch_size,
+          is_training=self._is_training)
       dataset = dataset.map(map_fn, num_parallel_calls=16)
 
     else:
       types = {movielens.USER_COLUMN: rconst.USER_DTYPE,
                movielens.ITEM_COLUMN: rconst.ITEM_DTYPE}
-      shapes = {movielens.USER_COLUMN: tf.TensorShape([batch_size]),
-                movielens.ITEM_COLUMN: tf.TensorShape([batch_size])}
+      shapes = {
+          movielens.USER_COLUMN: tf.TensorShape([batch_size, 1]),
+          movielens.ITEM_COLUMN: tf.TensorShape([batch_size, 1])
+      }
 
       if self._is_training:
         types[rconst.VALID_POINT_MASK] = np.bool
-        shapes[rconst.VALID_POINT_MASK] = tf.TensorShape([batch_size])
+        shapes[rconst.VALID_POINT_MASK] = tf.TensorShape([batch_size, 1])
 
         types = (types, np.bool)
-        shapes = (shapes, tf.TensorShape([batch_size]))
+        shapes = (shapes, tf.TensorShape([batch_size, 1]))
 
       else:
         types[rconst.DUPLICATE_MASK] = np.bool
-        shapes[rconst.DUPLICATE_MASK] = tf.TensorShape([batch_size])
+        shapes[rconst.DUPLICATE_MASK] = tf.TensorShape([batch_size, 1])
 
       data_generator = functools.partial(
           self.data_generator, epochs_between_evals=epochs_between_evals)
@@ -534,12 +546,17 @@ class BaseDataConstructor(threading.Thread):
       items = np.concatenate([items, item_pad])
       labels = np.concatenate([labels, label_pad])
 
-    self._train_dataset.put(i, {
-        movielens.USER_COLUMN: users,
-        movielens.ITEM_COLUMN: items,
-        rconst.MASK_START_INDEX: np.array(mask_start_index, dtype=np.int32),
-        "labels": labels,
-    })
+    self._train_dataset.put(
+        i, {
+            movielens.USER_COLUMN:
+                np.reshape(users, (self.train_batch_size, 1)),
+            movielens.ITEM_COLUMN:
+                np.reshape(items, (self.train_batch_size, 1)),
+            rconst.MASK_START_INDEX:
+                np.array(mask_start_index, dtype=np.int32),
+            "labels":
+                np.reshape(labels, (self.train_batch_size, 1)),
+        })
 
   def _wait_to_construct_train_epoch(self):
     count = 0
@@ -629,11 +646,15 @@ class BaseDataConstructor(threading.Thread):
     users, items, duplicate_mask = self._assemble_eval_batch(
         users, positive_items, negative_items, self._eval_users_per_batch)
 
-    self._eval_dataset.put(i, {
-        movielens.USER_COLUMN: users.flatten(),
-        movielens.ITEM_COLUMN: items.flatten(),
-        rconst.DUPLICATE_MASK: duplicate_mask.flatten(),
-    })
+    self._eval_dataset.put(
+        i, {
+            movielens.USER_COLUMN:
+                np.reshape(users.flatten(), (self.eval_batch_size, 1)),
+            movielens.ITEM_COLUMN:
+                np.reshape(items.flatten(), (self.eval_batch_size, 1)),
+            rconst.DUPLICATE_MASK:
+                np.reshape(duplicate_mask.flatten(), (self.eval_batch_size, 1)),
+        })
 
   def _construct_eval_epoch(self):
     """Loop to construct data for evaluation."""
@@ -672,6 +693,11 @@ class BaseDataConstructor(threading.Thread):
 class DummyConstructor(threading.Thread):
   """Class for running with synthetic data."""
 
+  def __init__(self, *args, **kwargs):
+    super(DummyConstructor, self).__init__(*args, **kwargs)
+    self.train_batches_per_epoch = rconst.SYNTHETIC_BATCHES_PER_EPOCH
+    self.eval_batches_per_epoch = rconst.SYNTHETIC_BATCHES_PER_EPOCH
+
   def run(self):
     pass
 
@@ -695,24 +721,37 @@ class DummyConstructor(threading.Thread):
       num_users = params["num_users"]
       num_items = params["num_items"]
 
-      users = tf.random.uniform([batch_size], dtype=tf.int32, minval=0,
+      users = tf.random.uniform([batch_size, 1],
+                                dtype=tf.int32,
+                                minval=0,
                                 maxval=num_users)
-      items = tf.random.uniform([batch_size], dtype=tf.int32, minval=0,
+      items = tf.random.uniform([batch_size, 1],
+                                dtype=tf.int32,
+                                minval=0,
                                 maxval=num_items)
 
       if is_training:
-        valid_point_mask = tf.cast(tf.random.uniform(
-            [batch_size], dtype=tf.int32, minval=0, maxval=2), tf.bool)
-        labels = tf.cast(tf.random.uniform(
-            [batch_size], dtype=tf.int32, minval=0, maxval=2), tf.bool)
+        valid_point_mask = tf.cast(
+            tf.random.uniform([batch_size, 1],
+                              dtype=tf.int32,
+                              minval=0,
+                              maxval=2), tf.bool)
+        labels = tf.cast(
+            tf.random.uniform([batch_size, 1],
+                              dtype=tf.int32,
+                              minval=0,
+                              maxval=2), tf.bool)
         data = {
             movielens.USER_COLUMN: users,
             movielens.ITEM_COLUMN: items,
             rconst.VALID_POINT_MASK: valid_point_mask,
         }, labels
       else:
-        dupe_mask = tf.cast(tf.random.uniform([batch_size], dtype=tf.int32,
-                                              minval=0, maxval=2), tf.bool)
+        dupe_mask = tf.cast(
+            tf.random.uniform([batch_size, 1],
+                              dtype=tf.int32,
+                              minval=0,
+                              maxval=2), tf.bool)
         data = {
             movielens.USER_COLUMN: users,
             movielens.ITEM_COLUMN: items,

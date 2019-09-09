@@ -31,15 +31,22 @@ import tensorflow as tf
 from official.bert import bert_models
 from official.bert import common_flags
 from official.bert import input_pipeline
+from official.bert import model_saving_utils
 from official.bert import model_training_utils
 from official.bert import modeling
 from official.bert import optimization
 from official.bert import squad_lib
 from official.bert import tokenization
-from official.bert import tpu_lib
+from official.utils.misc import keras_utils
+from official.utils.misc import tpu_lib
 
-flags.DEFINE_bool('do_train', False, 'Whether to run training.')
-flags.DEFINE_bool('do_predict', False, 'Whether to run eval on the dev set.')
+flags.DEFINE_enum(
+    'mode', 'train', ['train', 'predict', 'export_only'],
+    'One of {"train", "predict", "export_only"}. `train`: '
+    'trains the model and evaluates in the meantime. '
+    '`predict`: predict answers from the squad json file. '
+    '`export_only`: will take the latest checkpoint inside '
+    'model_dir and export a `SavedModel`.')
 flags.DEFINE_string('train_data_path', '',
                     'Training data path with train tfrecords.')
 flags.DEFINE_string(
@@ -81,7 +88,7 @@ def squad_loss_fn(start_positions,
                   end_positions,
                   start_logits,
                   end_logits,
-                  loss_scale=1.0):
+                  loss_factor=1.0):
   """Returns sparse categorical crossentropy for start/end logits."""
   start_loss = tf.keras.backend.sparse_categorical_crossentropy(
       start_positions, start_logits, from_logits=True)
@@ -89,11 +96,11 @@ def squad_loss_fn(start_positions,
       end_positions, end_logits, from_logits=True)
 
   total_loss = (tf.reduce_mean(start_loss) + tf.reduce_mean(end_loss)) / 2
-  total_loss *= loss_scale
+  total_loss *= loss_factor
   return total_loss
 
 
-def get_loss_fn(loss_scale=1.0):
+def get_loss_fn(loss_factor=1.0):
   """Gets a loss function for squad task."""
 
   def _loss_fn(labels, model_outputs):
@@ -105,7 +112,7 @@ def get_loss_fn(loss_scale=1.0):
         end_positions,
         start_logits,
         end_logits,
-        loss_scale=loss_scale)
+        loss_factor=loss_factor)
 
   return _loss_fn
 
@@ -138,13 +145,15 @@ def predict_squad_customized(strategy, input_meta_data, bert_config,
         strategy.experimental_distribute_dataset(predict_dataset))
 
     with strategy.scope():
+      # Prediction always uses float32, even if training uses mixed precision.
+      tf.keras.mixed_precision.experimental.set_policy('float32')
       squad_model, _ = bert_models.squad_model(
           bert_config, input_meta_data['max_seq_length'], float_type=tf.float32)
 
     checkpoint_path = tf.train.latest_checkpoint(FLAGS.model_dir)
     logging.info('Restoring checkpoints from %s', checkpoint_path)
     checkpoint = tf.train.Checkpoint(model=squad_model)
-    checkpoint.restore(checkpoint_path)
+    checkpoint.restore(checkpoint_path).expect_partial()
 
     @tf.function
     def predict_step(iterator):
@@ -173,13 +182,21 @@ def predict_squad_customized(strategy, input_meta_data, bert_config,
     return all_results
 
 
-def train_squad(strategy, input_meta_data, custom_callbacks=None):
+def train_squad(strategy,
+                input_meta_data,
+                custom_callbacks=None,
+                run_eagerly=False):
   """Run bert squad training."""
-  if not strategy:
-    raise ValueError('Distribution strategy cannot be None.')
+  if strategy:
+    logging.info('Training using customized training loop with distribution'
+                 ' strategy.')
+  # Enables XLA in Session Config. Should not be set for TPU.
+  keras_utils.set_config_v2(FLAGS.enable_xla)
 
-  logging.info('Training using customized training loop with distribution'
-               ' strategy.')
+  use_float16 = common_flags.use_float16()
+  if use_float16:
+    policy = tf.keras.mixed_precision.experimental.Policy('mixed_float16')
+    tf.keras.mixed_precision.experimental.set_policy(policy)
 
   bert_config = modeling.BertConfig.from_json_file(FLAGS.bert_config_file)
   epochs = FLAGS.num_train_epochs
@@ -195,17 +212,37 @@ def train_squad(strategy, input_meta_data, custom_callbacks=None):
       is_training=True)
 
   def _get_squad_model():
+    """Get Squad model and optimizer."""
     squad_model, core_model = bert_models.squad_model(
-        bert_config, max_seq_length, float_type=tf.float32)
+        bert_config,
+        max_seq_length,
+        float_type=tf.float16 if use_float16 else tf.float32)
     squad_model.optimizer = optimization.create_optimizer(
         FLAGS.learning_rate, steps_per_epoch * epochs, warmup_steps)
+    if use_float16:
+      # Wraps optimizer with a LossScaleOptimizer. This is done automatically
+      # in compile() with the "mixed_float16" policy, but since we do not call
+      # compile(), we must wrap the optimizer manually.
+      squad_model.optimizer = (
+          tf.keras.mixed_precision.experimental.LossScaleOptimizer(
+              squad_model.optimizer, loss_scale=common_flags.get_loss_scale()))
+    if FLAGS.fp16_implementation == 'graph_rewrite':
+      # Note: when flags_obj.fp16_implementation == "graph_rewrite", dtype as
+      # determined by flags_core.get_tf_dtype(flags_obj) would be 'float32'
+      # which will ensure tf.compat.v2.keras.mixed_precision and
+      # tf.train.experimental.enable_mixed_precision_graph_rewrite do not double
+      # up.
+      squad_model.optimizer = tf.train.experimental.enable_mixed_precision_graph_rewrite(
+          squad_model.optimizer)
     return squad_model, core_model
 
   # The original BERT model does not scale the loss by
   # 1/num_replicas_in_sync. It could be an accident. So, in order to use
   # the same hyper parameter, we do the same thing here by keeping each
   # replica loss as it is.
-  loss_fn = get_loss_fn(loss_scale=1.0)
+  loss_fn = get_loss_fn(
+      loss_factor=1.0 /
+      strategy.num_replicas_in_sync if FLAGS.scale_loss else 1.0)
   use_remote_tpu = (FLAGS.strategy_type == 'tpu' and FLAGS.tpu)
 
   model_training_utils.run_customized_training_loop(
@@ -219,6 +256,7 @@ def train_squad(strategy, input_meta_data, custom_callbacks=None):
       train_input_fn=train_input_fn,
       init_checkpoint=FLAGS.init_checkpoint,
       use_remote_tpu=use_remote_tpu,
+      run_eagerly=run_eagerly,
       custom_callbacks=custom_callbacks)
 
 
@@ -289,6 +327,26 @@ def predict_squad(strategy, input_meta_data):
       verbose=FLAGS.verbose_logging)
 
 
+def export_squad(model_export_path, input_meta_data):
+  """Exports a trained model as a `SavedModel` for inference.
+
+  Args:
+    model_export_path: a string specifying the path to the SavedModel directory.
+    input_meta_data: dictionary containing meta data about input and model.
+
+  Raises:
+    Export path is not specified, got an empty string or None.
+  """
+  if not model_export_path:
+    raise ValueError('Export path is not specified: %s' % model_export_path)
+  bert_config = modeling.BertConfig.from_json_file(FLAGS.bert_config_file)
+
+  squad_model, _ = bert_models.squad_model(
+      bert_config, input_meta_data['max_seq_length'], float_type=tf.float32)
+  model_saving_utils.export_bert_model(
+      model_export_path, model=squad_model, checkpoint_dir=FLAGS.model_dir)
+
+
 def main(_):
   # Users should always run this script under TF 2.x
   assert tf.version.VERSION.startswith('2.')
@@ -296,9 +354,15 @@ def main(_):
   with tf.io.gfile.GFile(FLAGS.input_meta_data_path, 'rb') as reader:
     input_meta_data = json.loads(reader.read().decode('utf-8'))
 
+  if FLAGS.mode == 'export_only':
+    export_squad(FLAGS.model_export_path, input_meta_data)
+    return
+
   strategy = None
   if FLAGS.strategy_type == 'mirror':
     strategy = tf.distribute.MirroredStrategy()
+  elif FLAGS.strategy_type == 'multi_worker_mirror':
+    strategy = tf.distribute.experimental.MultiWorkerMirroredStrategy()
   elif FLAGS.strategy_type == 'tpu':
     # Initialize TPU System.
     cluster_resolver = tpu_lib.tpu_initialize(FLAGS.tpu)
@@ -306,9 +370,9 @@ def main(_):
   else:
     raise ValueError('The distribution strategy type is not supported: %s' %
                      FLAGS.strategy_type)
-  if FLAGS.do_train:
+  if FLAGS.mode == 'train':
     train_squad(strategy, input_meta_data)
-  if FLAGS.do_predict:
+  if FLAGS.mode == 'predict':
     predict_squad(strategy, input_meta_data)
 
 

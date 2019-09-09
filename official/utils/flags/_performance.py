@@ -53,15 +53,16 @@ def get_loss_scale(flags_obj, default_for_fp16):
     return default_for_fp16
 
 
-def define_performance(num_parallel_calls=True, inter_op=True, intra_op=True,
-                       synthetic_data=True, max_train_steps=True, dtype=True,
-                       all_reduce_alg=True, num_packs=True,
+def define_performance(num_parallel_calls=False, inter_op=False, intra_op=False,
+                       synthetic_data=False, max_train_steps=False, dtype=False,
+                       all_reduce_alg=False, num_packs=False,
                        tf_gpu_thread_mode=False,
                        datasets_num_private_threads=False,
                        datasets_num_parallel_batches=False,
                        dynamic_loss_scale=False, fp16_implementation=False,
                        loss_scale=False,
-                       tf_data_experimental_slack=False, enable_xla=False):
+                       tf_data_experimental_slack=False, enable_xla=False,
+                       force_v2_in_keras_compile=False):
   """Register flags for specifying performance tuning arguments.
 
   Args:
@@ -87,6 +88,9 @@ def define_performance(num_parallel_calls=True, inter_op=True, intra_op=True,
     tf_data_experimental_slack: Determines whether to enable tf.data's
       `experimental_slack` option.
     enable_xla: Determines if XLA (auto clustering) is turned on.
+    force_v2_in_keras_compile: Forces the use of run_distribued path even if not
+      using a `strategy`. This is not the same as
+      `tf.distribute.OneDeviceStrategy`
 
   Returns:
     A list of flags for core.py to marks as key flags.
@@ -186,7 +190,7 @@ def define_performance(num_parallel_calls=True, inter_op=True, intra_op=True,
         return loss_scale > 0
 
     if fp16_implementation:
-      # Currently, this flag is only defined for the estimator resnet model.
+      # Currently, this flag is only defined for the estimator resnet and transformer models.
       flags.DEFINE_enum(
           name="fp16_implementation", default="casting",
           enum_values=("casting', 'graph_rewrite"),
@@ -205,11 +209,6 @@ def define_performance(num_parallel_calls=True, inter_op=True, intra_op=True,
             flags_dict["dtype"] != "fp16"):
           raise flags.ValidationError("--fp16_implementation should not be "
                                       "specified unless --dtype=fp16")
-        if (flags_dict["fp16_implementation"] != "graph_rewrite" and
-            flags_dict["loss_scale"] == "dynamic"):
-          raise flags.ValidationError("--loss_scale=dynamic is only supported "
-                                      "when "
-                                      "--fp16_implementation=graph_rewrite")
         return True
 
   if all_reduce_alg:
@@ -275,5 +274,12 @@ def define_performance(num_parallel_calls=True, inter_op=True, intra_op=True,
     flags.DEFINE_boolean(
         name="enable_xla", default=False,
         help="Whether to enable XLA auto jit compilation")
+
+  if force_v2_in_keras_compile:
+    flags.DEFINE_boolean(
+        name="force_v2_in_keras_compile", default=None,
+        help="Forces the use of run_distribued path even if not"
+             "using a `strategy`. This is not the same as"
+             "`tf.distribute.OneDeviceStrategy`")
 
   return key_flags
